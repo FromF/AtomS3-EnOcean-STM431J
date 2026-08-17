@@ -43,19 +43,21 @@ M5AtomS3とSTM431JモジュールでEnOceanデータを受信・表示するArdu
 ### 開発環境
 
 - Arduino IDE 1.8.x 以上 または Arduino IDE 2.x
-- ESP32ボードサポート（esp32 by Espressif Systems）
+- ESP32ボードサポート 3.2.0以上（M5StackまたはEspressif Systems）
 
 ### 必要なライブラリ
 
-1. **M5AtomS3** - M5Stack公式ライブラリ
+1. **M5Unified** - M5Stack公式ライブラリ
    ```
-   ライブラリマネージャーで「M5AtomS3」を検索してインストール
+   ライブラリマネージャーで「M5Unified」を検索してインストール
    ```
 
-2. **esp32-usb-serial** - USB CDC-ACM通信ライブラリ
+2. **EspUsbHost** - USB CDC-ACM/VCP通信ライブラリ
    ```
-   https://github.com/luc-github/esp32-usb-serial
+   Arduino IDEのライブラリマネージャーで「EspUsbHost」を検索してインストール
    ```
+
+   GitHub: https://github.com/tanakamasayuki/EspUsbHost
 
 ### 通信設定
 
@@ -135,7 +137,8 @@ EnOcean標準CRC8多項式: `0x07`
 ### USB400Jが認識されない
 
 - USB400JがM5AtomS3のUSBポートに正しく接続されているか確認
-- Serial2のデバッグ出力で"USB Connected"が表示されるか確認
+- Serial2のデバッグ出力で"USB Serial Connected"が表示されるか確認
+- EspUsbHostがインストールされ、ESP32ボードサポートが3.2.0以上であることを確認
 - USB CDC On Bootが有効になっているか確認
 
 ### データが受信できない
@@ -162,7 +165,7 @@ Copyright (c) 2026 Haruhito Fuji
 - [EnOcean Alliance](https://www.enocean-alliance.org/)
 - [EnOcean Serial Protocol (ESP3)](https://www.enocean.com/esp)
 - [M5AtomS3 Docs](https://docs.m5stack.com/en/core/AtomS3)
-- [esp32-usb-serial Library](https://github.com/luc-github/esp32-usb-serial)
+- [EspUsbHost Library](https://github.com/tanakamasayuki/EspUsbHost)
 
 ## 開発者
 
@@ -170,6 +173,10 @@ Haruhito Fuji
 
 ## 更新履歴
 
+- **2026-08-17**: USB HostライブラリをEspUsbHostへ変更
+  - EspUsbHostCdcSerialによるUSB CDC-ACM/VCP通信へ移行
+  - 独自のUSB接続タスクとセマフォを削除
+  - M5AtomS3ラッパーをM5Unifiedの直接利用へ変更
 - **2026-01-25**: 初版リリース
   - EnOcean ESP3プロトコル対応
   - EEP A5-02-05（温度センサー）実装

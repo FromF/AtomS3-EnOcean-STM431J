@@ -29,8 +29,8 @@
  *   - USB: USB400J接続
  * 
  * @dependencies
- *   - M5AtomS3 Library
- *   - esp32-usb-serial (https://github.com/luc-github/esp32-usb-serial)
+ *   - M5Unified Library
+ *   - EspUsbHost (https://github.com/tanakamasayuki/EspUsbHost)
  * 
  * @communication
  *   - STM431J: 57600bps, 8N1, USB CDC-ACM
@@ -48,31 +48,15 @@
  * 
  ******************************************************************************/
 
-#include "M5AtomS3.h"
+#include "M5Unified.h"
+#include "EspUsbHost.h"
 
-#include "esp32_usb_serial.h"
-#include "freertos/FreeRTOS.h"
-#include "freertos/semphr.h"
-#include "freertos/task.h"
+#define USB_SERIAL_BAUDRATE 57600
+#define USB_SERIAL_RX_BUFFER_SIZE 512
 
-#define ESP_USB_SERIAL_BAUDRATE 57600
-#define ESP_USB_SERIAL_DATA_BITS (8)
-// 0: 1 stopbit, 1: 1.5 stopbits, 2: 2 stopbits
-#define ESP_USB_SERIAL_PARITY (0)
-// 0: None, 1: Odd, 2: Even, 3: Mark, 4: Space
-#define ESP_USB_SERIAL_STOP_BITS (0)
-
-#define ESP_USB_SERIAL_RX_BUFFER_SIZE 512
-#define ESP_USB_SERIAL_TX_BUFFER_SIZE 128
-#define ESP_USB_SERIAL_TASK_SIZE 4096
-#define ESP_USB_SERIAL_TASK_CORE 1
-#define ESP_USB_SERIAL_TASK_PRIORITY 10
-
-SemaphoreHandle_t device_disconnected_sem;
-std::unique_ptr<CdcAcmDevice> vcp;
+EspUsbHost usb;
+EspUsbHostCdcSerial usbSerial(usb);
 bool isConnected = false;
-bool usbReady = false;
-TaskHandle_t xHandle;
 
 // EnOcean受信バッファ
 #define ENOCEAN_BUFFER_SIZE 256
@@ -164,10 +148,24 @@ bool parseEnOceanPacket(const uint8_t *buffer, size_t len, EnOceanPacket &packet
   return true;
 }
 
+void displayEnOceanPacket(const EnOceanPacket &packet) {
+  M5.Display.fillScreen(BLACK);
+  M5.Display.setCursor(0, 0);
+  M5.Display.setTextSize(1);
+  M5.Display.setTextColor(WHITE);
+
+  M5.Display.println("EnOcean受信:");
+  M5.Display.println();
+  M5.Display.printf("ID: %08X\n", packet.senderId);
+  M5.Display.println();
+  M5.Display.setTextSize(2);
+  M5.Display.printf("温度: %.1f C\n", packet.temperature);
+}
+
 /**
- * @brief Data received callback
+ * @brief EspUsbHostの受信リングから読み出したデータを処理
  */
-bool rx_callback(const uint8_t *data, size_t data_len, void *arg) {
+void processReceivedData(const uint8_t *data, size_t data_len) {
   // デバッグ用：受信データを16進数で表示
   Serial2.print("RX: ");
   for (size_t i = 0; i < data_len; i++) {
@@ -177,143 +175,88 @@ bool rx_callback(const uint8_t *data, size_t data_len, void *arg) {
   }
   Serial2.println();
 
-  // バッファに追加
   for (size_t i = 0; i < data_len; i++) {
+    const uint8_t value = data[i];
+
+    // 同期バイトを受信するまでは読み飛ばす
+    if (enoceanBufferIndex == 0) {
+      if (value != 0x55) {
+        continue;
+      }
+      enoceanBuffer[enoceanBufferIndex++] = value;
+      continue;
+    }
+
     if (enoceanBufferIndex >= ENOCEAN_BUFFER_SIZE) {
-      enoceanBufferIndex = 0;  // オーバーフロー時はリセット
+      Serial2.println("EnOcean buffer overflow");
+      enoceanBufferIndex = 0;
+      continue;
     }
-    enoceanBuffer[enoceanBufferIndex++] = data[i];
+    enoceanBuffer[enoceanBufferIndex++] = value;
 
-    // 同期バイト検出
-    if (data[i] == 0x55 && i == 0) {
-      // 新しいパケットの開始
-      enoceanBufferIndex = 1;
-      enoceanBuffer[0] = 0x55;
+    if (enoceanBufferIndex < 6) {
+      continue;
     }
-  }
 
-  // パケット解析を試行
-  if (enoceanBufferIndex >= 6) {
-    EnOceanPacket packet;
-    if (parseEnOceanPacket(enoceanBuffer, enoceanBufferIndex, packet)) {
-      // 解析成功、ディスプレイを更新
-      M5.Display.fillScreen(BLACK);
-      M5.Display.setCursor(0, 0);
-      M5.Display.setTextSize(1);
-      M5.Display.setTextColor(WHITE);
+    // ヘッダーが壊れている場合は早めに同期待ちへ戻る
+    if (enoceanBufferIndex == 6 && calcCRC8(&enoceanBuffer[1], 4) != enoceanBuffer[5]) {
+      Serial2.println("Header CRC error");
+      enoceanBufferIndex = 0;
+      continue;
+    }
 
-      M5.Display.println("EnOcean受信:");
-      M5.Display.println();
-      M5.Display.printf("ID: %08X\n", packet.senderId);
-      M5.Display.println();
-      M5.Display.setTextSize(2);
-      M5.Display.printf("温度: %.1f C\n", packet.temperature);
+    const size_t packetLength = 7 +
+                                (((size_t)enoceanBuffer[1] << 8) | enoceanBuffer[2]) +
+                                enoceanBuffer[3];
+    if (packetLength > ENOCEAN_BUFFER_SIZE) {
+      Serial2.println("EnOcean packet too large");
+      enoceanBufferIndex = 0;
+      continue;
+    }
 
-      // バッファをクリア
+    if (enoceanBufferIndex == packetLength) {
+      EnOceanPacket packet = {};
+      if (parseEnOceanPacket(enoceanBuffer, enoceanBufferIndex, packet)) {
+        displayEnOceanPacket(packet);
+      }
       enoceanBufferIndex = 0;
     }
   }
-
-  return true;
 }
 
-/**
- * @brief Device event callback
- *
- * Apart from handling device disconnection it doesn't do anything useful
- */
-void handle_event(const cdc_acm_host_dev_event_data_t *event, void *user_ctx) {
-  switch (event->type) {
-    case CDC_ACM_HOST_ERROR:
-      Serial2.printf("CDC-ACM error has occurred, err_no = %d\n",
-                     event->data.error);
-      break;
-    case CDC_ACM_HOST_DEVICE_DISCONNECTED:
-      Serial2.println("Device suddenly disconnected");
-      xSemaphoreGive(device_disconnected_sem);
-      isConnected = false;
-      break;
-    case CDC_ACM_HOST_SERIAL_STATE:
-      Serial2.printf("Serial state notif 0x%04X\n",
-                     event->data.serial_state.val);
-      break;
-    case CDC_ACM_HOST_NETWORK_CONNECTION:
-      Serial2.println("Network connection established");
-      break;
-    default:
-      Serial2.println("Unknown event");
-      break;
-  }
-}
+void handleUsbSerialInput() {
+  uint8_t data[64];
 
-void connectDevice() {
-  if (!usbReady || isConnected) {
-    return;
-  }
-  const cdc_acm_host_device_config_t dev_config = {
-    .connection_timeout_ms = 5000,  // 5 seconds, enough time to plug the
-                                    // device in or experiment with timeout
-    .out_buffer_size = ESP_USB_SERIAL_TX_BUFFER_SIZE,
-    .in_buffer_size = ESP_USB_SERIAL_RX_BUFFER_SIZE,
-    .event_cb = handle_event,
-    .data_cb = rx_callback,
-    .user_arg = NULL,
-  };
-  cdc_acm_line_coding_t line_coding = {
-    .dwDTERate = ESP_USB_SERIAL_BAUDRATE,
-    .bCharFormat = ESP_USB_SERIAL_STOP_BITS,
-    .bParityType = ESP_USB_SERIAL_PARITY,
-    .bDataBits = ESP_USB_SERIAL_DATA_BITS,
-  };
-  // You don't need to know the device's VID and PID. Just plug in any device
-  // and the VCP service will pick correct (already registered) driver for the
-  // device
-  Serial2.println("Opening any VCP device...");
-  vcp = std::unique_ptr<CdcAcmDevice>(esp_usb::VCP::open(&dev_config));
+  while (usbSerial.available() > 0) {
+    size_t dataLength = 0;
+    while (dataLength < sizeof(data) && usbSerial.available() > 0) {
+      const int value = usbSerial.read();
+      if (value < 0) {
+        break;
+      }
+      data[dataLength++] = (uint8_t)value;
+    }
 
-  if (vcp == nullptr) {
-    Serial2.println("Failed to open VCP device, retrying...");
-    return;
-  }
-
-  vTaskDelay(10);
-
-  Serial2.println("USB detected");
-
-  if (vcp->line_coding_set(&line_coding) == ESP_OK) {
-    Serial2.println("USB Connected");
-    isConnected = true;
-    uint16_t vid = esp_usb::getVID();
-    uint16_t pid = esp_usb::getPID();
-    Serial2.printf("USB device with VID: 0x%04X (%s), PID: 0x%04X (%s) found\n",
-                   vid, esp_usb::getVIDString(), pid, esp_usb::getPIDString());
-    xSemaphoreTake(device_disconnected_sem, portMAX_DELAY);
-    vTaskDelay(10);
-
-    vcp = nullptr;
-  } else {
-    Serial2.println("USB device not identified");
-  }
-}
-
-// this task only handle connection
-static void esp_usb_serial_connection_task(void *pvParameter) {
-  (void)pvParameter;
-  while (1) {
-    /* Delay */
-    vTaskDelay(pdMS_TO_TICKS(10));
-    if (!usbReady) {
+    if (dataLength == 0) {
       break;
     }
-    connectDevice();
+    processReceivedData(data, dataLength);
   }
-  /* A task should NEVER return */
-  vTaskDelete(NULL);
+}
+
+void updateUsbConnectionState() {
+  const bool connected = usbSerial.connected();
+  if (connected == isConnected) {
+    return;
+  }
+
+  isConnected = connected;
+  Serial2.println(isConnected ? "USB Serial Connected" : "USB Serial Disconnected");
 }
 
 void setup() {
   auto cfg = M5.config();
-  AtomS3.begin(cfg);
+  M5.begin(cfg);
 
   // Serial.begin(115200);
   Serial2.begin(115200, SERIAL_8N1, 5, 6);  // MAX3232側のシリアルの初期化
@@ -322,30 +265,26 @@ void setup() {
   Serial2.println("");
 
   // USB初期化
-  if (ESP_OK != usb_serial_init()) {
-    Serial2.println("Initialisation failed");
-  } else {
-    if (ESP_OK != usb_serial_create_task()) {
-      Serial2.println("Task Creation failed");
-    } else {
-      Serial2.println("Success");
-    }
-    device_disconnected_sem = xSemaphoreCreateBinary();
-    if (device_disconnected_sem == NULL) {
-      Serial2.println("Semaphore creation failed");
-      return;
-    }
-    BaseType_t res = xTaskCreatePinnedToCore(
-      esp_usb_serial_connection_task, "esp_usb_serial_task",
-      ESP_USB_SERIAL_TASK_SIZE, NULL, ESP_USB_SERIAL_TASK_PRIORITY, &xHandle,
-      ESP_USB_SERIAL_TASK_CORE);
-    if (res != pdPASS || !xHandle) {
-      Serial2.println("Task creation failed");
-      return;
-    }
-    Serial2.println("USB Serial Connection Task created successfully");
+  usb.onDeviceConnected([](const EspUsbHostDeviceInfo &device) {
+    Serial2.print("USB device connected: ");
+    espUsbHostPrint(device, Serial2);
+  });
+  usb.onDeviceDisconnected([](const EspUsbHostDeviceInfo &device) {
+    Serial2.print("USB device disconnected: ");
+    espUsbHostPrint(device, Serial2);
+  });
+
+  if (!usbSerial.setRxBufferSize(USB_SERIAL_RX_BUFFER_SIZE)) {
+    Serial2.println("USB Serial RX buffer allocation failed");
   }
-  usbReady = true;
+  if (!usbSerial.begin(USB_SERIAL_BAUDRATE)) {
+    Serial2.println("USB Serial initialization failed");
+  }
+  if (!usb.begin()) {
+    Serial2.printf("USB Host initialization failed: %s\n", usb.lastErrorName());
+  } else {
+    Serial2.println("USB Host initialized");
+  }
 
   // ディスプレイの初期化
   M5.Display.setRotation(1);
@@ -359,6 +298,8 @@ void setup() {
 
 void loop() {
   M5.update();
+  updateUsbConnectionState();
+  handleUsbSerialInput();
 
   if (M5.BtnA.isPressed()) {
     M5.Display.fillScreen(BLACK);
@@ -367,4 +308,6 @@ void loop() {
     M5.Display.println("画面クリア");
     M5.Display.println("EnOcean待機中...");
   }
+
+  delay(1);
 }
