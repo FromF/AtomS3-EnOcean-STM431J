@@ -222,6 +222,14 @@ bool parseEnOceanPacket(const uint8_t *buffer, size_t len, EnOceanPacket &packet
 
   // DATA末尾の1バイトはERP2自身のCRC
   const size_t erp2CrcOffset = packet.dataLength - 1;
+  const uint8_t expectedErp2Crc = packet.data[erp2CrcOffset];
+  const uint8_t calculatedErp2Crc = calcCRC8(packet.data, erp2CrcOffset);
+  if (calculatedErp2Crc != expectedErp2Crc) {
+    Serial2.printf("Invalid ERP2 CRC: expected 0x%02X, calculated 0x%02X\n",
+                   expectedErp2Crc, calculatedErp2Crc);
+    return false;
+  }
+
   if (radioOptionalLength > erp2CrcOffset - cursor) return false;
   const size_t radioDataEnd = erp2CrcOffset - radioOptionalLength;
   if (cursor + originatorLength + destinationLength > radioDataEnd) return false;
