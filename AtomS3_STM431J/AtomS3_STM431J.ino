@@ -241,8 +241,9 @@ bool parseEnOceanPacket(const uint8_t *buffer, size_t len, EnOceanPacket &packet
   formatSenderId(packet.senderId, packet.senderIdLength,
                  senderIdText, sizeof(senderIdText));
   if (packet.teachIn) {
+    packet.valid = true;
     Serial2.printf("Teach-in telegram from Device ID: %s\n", senderIdText);
-    return false;
+    return true;
   }
 
   // EEP A5-02-05: DB1の255..0を0..40℃へ変換
@@ -267,8 +268,16 @@ void displayEnOceanPacket(const EnOceanPacket &packet) {
 
   M5.Display.println("EnOcean受信:");
   M5.Display.println();
+
   M5.Display.printf("ID: %s\n", senderIdText);
   M5.Display.println();
+
+  if (packet.teachIn) {
+    M5.Display.setTextSize(2);
+    M5.Display.println("Teach-in");
+    return;
+  }
+
   M5.Display.setTextSize(2);
   M5.Display.printf("温度: %.1f C\n", packet.temperature);
 }

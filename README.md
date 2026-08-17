@@ -93,9 +93,8 @@ M5AtomS3とSTM431JモジュールでEnOceanデータを受信・表示するArdu
 
 2. **データ受信**
    - STM431J（または他のEnOceanセンサー）が送信を開始すると自動的にデータを受信
-   - ディスプレイに以下が表示されます：
-     - デバイスID（32bit/48bit、16進数）
-     - 温度（℃、小数点1桁）
+   - 通常データ受信時はデバイスID（32bit/48bit、16進数）と温度（℃、小数点1桁）を表示
+   - Teach-in受信時はデバイスIDと、その下に`Teach-in`を表示
 
 3. **操作**
    - **ボタンA押下**: 画面をクリア
@@ -143,14 +142,24 @@ ESP3の`Data`には、先頭のLENGTHを除いたERP2 telegramが格納されま
 実機で取得したSTM431Jの例:
 
 ```text
-# Teach-in telegram（48bit ID=0x00000400CB76、表示対象外）
+# Teach-in telegram（48bit ID=0x00000400CB76、液晶にTeach-inとIDを表示）
 55 00 0C 02 0A E6 62 00 00 04 00 CB 76 08 28 0B 80 89 01 2B C4
 
 # 通常データtelegram（32bit ID、ID=0x0400CB76）
 55 00 0A 02 0A 9B 22 04 00 CB 76 00 00 55 08 BD 01 29 CA
 ```
 
-4BSの`DB0`にあるLearn bitが0の場合はTeach-in telegramとして表示対象から除外します。
+4BSの`DB0`にあるLearn bitが0の場合はTeach-in telegramとして判定し、
+液晶にOriginator IDと、その下に`Teach-in`を表示します。
+
+```text
+EnOcean受信:
+
+ID: 00000400CB76
+
+Teach-in
+```
+
 通常データでは`DB1`をA5-02-05の温度値として、次式で0〜40℃に変換します。
 
 ```text
@@ -233,6 +242,7 @@ Haruhito Fuji
   - RADIO_ERP2の32bit/48bit Originator IDとTeach-in判定に対応
   - EEP A5-02-05の温度変換式を修正
   - USB読み出し単位と再構築済みESP3パケットのログを分離
+  - Teach-in受信時の液晶表示を追加
 - **2026-01-25**: 初版リリース
   - EnOcean ESP3プロトコル対応
   - EEP A5-02-05（温度センサー）実装
