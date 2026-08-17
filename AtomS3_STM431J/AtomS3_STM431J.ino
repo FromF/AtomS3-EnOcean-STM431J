@@ -147,6 +147,16 @@ void formatSenderId(uint64_t senderId, uint8_t senderIdLength,
            (unsigned long)(senderId & 0xFFFFFFFFULL));
 }
 
+void printHexBytes(const char *label, const uint8_t *data, size_t length) {
+  Serial2.printf("%s (%u bytes): ", label, (unsigned int)length);
+  for (size_t i = 0; i < length; i++) {
+    if (data[i] < 16) Serial2.print('0');
+    Serial2.print(data[i], HEX);
+    Serial2.print(' ');
+  }
+  Serial2.println();
+}
+
 /**
  * @brief EnOceanパケット解析
  */
@@ -321,6 +331,9 @@ void processEsp3ReceiveBuffer() {
       return;
     }
 
+    // USBの読み出し境界ではなく、再構築済みのESP3パケットを1行で表示
+    printHexBytes("ESP3 packet", esp3ReceiveBuffer, packetLength);
+
     const size_t payloadLength = (size_t)dataLength + optionalLength;
     const uint8_t expectedDataCrc =
       esp3ReceiveBuffer[ESP3_HEADER_SIZE + payloadLength];
@@ -345,14 +358,8 @@ void processEsp3ReceiveBuffer() {
  * @brief EspUsbHostの受信リングから読み出したデータを一時バッファへ蓄積
  */
 void processReceivedData(const uint8_t *data, size_t dataLength) {
-  // デバッグ用：今回読み出した単位の受信データを16進数で表示
-  Serial2.print("RX: ");
-  for (size_t i = 0; i < dataLength; i++) {
-    if (data[i] < 16) Serial2.print('0');
-    Serial2.print(data[i], HEX);
-    Serial2.print(' ');
-  }
-  Serial2.println();
+  // USB CDCから今回読み出せた単位。ESP3パケット境界とは一致しない場合がある
+  printHexBytes("USB chunk", data, dataLength);
 
   size_t offset = 0;
   while (offset < dataLength) {
