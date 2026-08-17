@@ -52,20 +52,22 @@
 #include "EspUsbHost.h"
 
 #define USB_SERIAL_BAUDRATE 57600
-#define USB_SERIAL_RX_BUFFER_SIZE 512
+#define USB_SERIAL_RX_BUFFER_SIZE 1024
+#define ESP3_RECEIVE_BUFFER_SIZE 1024
+#define ESP3_HEADER_SIZE 6
+#define ESP3_SYNC_BYTE 0x55
 
 EspUsbHost usb;
 EspUsbHostCdcSerial usbSerial(usb);
 bool isConnected = false;
 
-// EnOcean受信バッファ
-#define ENOCEAN_BUFFER_SIZE 256
-uint8_t enoceanBuffer[ENOCEAN_BUFFER_SIZE];
-size_t enoceanBufferIndex = 0;
+// USBの読み出し境界に依存せず、完全なESP3パケットになるまで保持する
+uint8_t esp3ReceiveBuffer[ESP3_RECEIVE_BUFFER_SIZE];
+size_t esp3ReceiveLength = 0;
 
 // EnOceanパケット構造体
 struct EnOceanPacket {
-  uint8_t dataLength;
+  uint16_t dataLength;
   uint8_t optionalLength;
   uint8_t packetType;
   uint8_t data[256];
@@ -97,16 +99,20 @@ uint8_t calcCRC8(const uint8_t *data, size_t len) {
  * @brief EnOceanパケット解析
  */
 bool parseEnOceanPacket(const uint8_t *buffer, size_t len, EnOceanPacket &packet) {
-  if (len < 6) return false;
-  if (buffer[0] != 0x55) return false;  // 同期バイトチェック
+  if (len < ESP3_HEADER_SIZE) return false;
+  if (buffer[0] != ESP3_SYNC_BYTE) return false;  // 同期バイトチェック
 
-  packet.dataLength = (buffer[1] << 8) | buffer[2];
+  packet.dataLength = ((uint16_t)buffer[1] << 8) | buffer[2];
   packet.optionalLength = buffer[3];
   packet.packetType = buffer[4];
 
   // パケット全体の長さチェック
-  size_t totalLen = 6 + packet.dataLength + packet.optionalLength + 1;
+  size_t totalLen = ESP3_HEADER_SIZE + packet.dataLength + packet.optionalLength + 1;
   if (len < totalLen) return false;
+  if (packet.dataLength > sizeof(packet.data)) {
+    Serial2.println("ESP3 payload too large");
+    return false;
+  }
 
   // ヘッダーCRCチェック
   uint8_t headerCRC = calcCRC8(&buffer[1], 4);
@@ -141,7 +147,8 @@ bool parseEnOceanPacket(const uint8_t *buffer, size_t len, EnOceanPacket &packet
       uint8_t tempValue = packet.data[2];
       packet.temperature = (float)tempValue * 40.0 / 250.0;
 
-      Serial2.printf("Device ID: %08X, Temp: %.1f C\n", packet.senderId, packet.temperature);
+      Serial2.printf("Device ID: %08lX, Temp: %.1f C\n",
+                     (unsigned long)packet.senderId, packet.temperature);
     }
   }
 
@@ -156,72 +163,124 @@ void displayEnOceanPacket(const EnOceanPacket &packet) {
 
   M5.Display.println("EnOcean受信:");
   M5.Display.println();
-  M5.Display.printf("ID: %08X\n", packet.senderId);
+  M5.Display.printf("ID: %08lX\n", (unsigned long)packet.senderId);
   M5.Display.println();
   M5.Display.setTextSize(2);
   M5.Display.printf("温度: %.1f C\n", packet.temperature);
 }
 
+void discardEsp3ReceiveBytes(size_t count) {
+  if (count >= esp3ReceiveLength) {
+    esp3ReceiveLength = 0;
+    return;
+  }
+
+  memmove(esp3ReceiveBuffer, &esp3ReceiveBuffer[count], esp3ReceiveLength - count);
+  esp3ReceiveLength -= count;
+}
+
+void clearEsp3ReceiveBuffer() {
+  esp3ReceiveLength = 0;
+}
+
 /**
- * @brief EspUsbHostの受信リングから読み出したデータを処理
+ * @brief 蓄積済みデータから完全なESP3パケットをすべて取り出す
  */
-void processReceivedData(const uint8_t *data, size_t data_len) {
-  // デバッグ用：受信データを16進数で表示
+void processEsp3ReceiveBuffer() {
+  while (esp3ReceiveLength > 0) {
+    // 同期ずれしたデータを捨て、次の0x55をパケット先頭候補にする
+    size_t syncOffset = 0;
+    while (syncOffset < esp3ReceiveLength &&
+           esp3ReceiveBuffer[syncOffset] != ESP3_SYNC_BYTE) {
+      syncOffset++;
+    }
+    if (syncOffset > 0) {
+      Serial2.printf("ESP3 resync: discarded %u byte(s)\n", (unsigned int)syncOffset);
+      discardEsp3ReceiveBytes(syncOffset);
+    }
+
+    // ヘッダーが分割されている場合は次の受信を待つ
+    if (esp3ReceiveLength < ESP3_HEADER_SIZE) {
+      return;
+    }
+
+    if (calcCRC8(&esp3ReceiveBuffer[1], 4) != esp3ReceiveBuffer[5]) {
+      Serial2.println("Header CRC error; resynchronizing");
+      discardEsp3ReceiveBytes(1);
+      continue;
+    }
+
+    const uint16_t dataLength =
+      ((uint16_t)esp3ReceiveBuffer[1] << 8) | esp3ReceiveBuffer[2];
+    const uint8_t optionalLength = esp3ReceiveBuffer[3];
+    const size_t packetLength = ESP3_HEADER_SIZE +
+                                (size_t)dataLength + optionalLength + 1;
+
+    if (packetLength > ESP3_RECEIVE_BUFFER_SIZE) {
+      Serial2.printf("ESP3 packet too large: %u byte(s)\n", (unsigned int)packetLength);
+      discardEsp3ReceiveBytes(1);
+      continue;
+    }
+
+    // データ部が分割されている場合は完全なパケットになるまで保持する
+    if (esp3ReceiveLength < packetLength) {
+      return;
+    }
+
+    const size_t payloadLength = (size_t)dataLength + optionalLength;
+    const uint8_t expectedDataCrc =
+      esp3ReceiveBuffer[ESP3_HEADER_SIZE + payloadLength];
+    const uint8_t calculatedDataCrc =
+      calcCRC8(&esp3ReceiveBuffer[ESP3_HEADER_SIZE], payloadLength);
+    if (calculatedDataCrc == expectedDataCrc) {
+      EnOceanPacket packet = {};
+      if (parseEnOceanPacket(esp3ReceiveBuffer, packetLength, packet)) {
+        displayEnOceanPacket(packet);
+      }
+    } else {
+      Serial2.printf("Invalid ESP3 data CRC: expected 0x%02X, calculated 0x%02X\n",
+                     expectedDataCrc, calculatedDataCrc);
+    }
+
+    // CRC不正時もヘッダーで算出したパケット長を捨て、次のパケットへ進む
+    discardEsp3ReceiveBytes(packetLength);
+  }
+}
+
+/**
+ * @brief EspUsbHostの受信リングから読み出したデータを一時バッファへ蓄積
+ */
+void processReceivedData(const uint8_t *data, size_t dataLength) {
+  // デバッグ用：今回読み出した単位の受信データを16進数で表示
   Serial2.print("RX: ");
-  for (size_t i = 0; i < data_len; i++) {
+  for (size_t i = 0; i < dataLength; i++) {
     if (data[i] < 16) Serial2.print('0');
     Serial2.print(data[i], HEX);
     Serial2.print(' ');
   }
   Serial2.println();
 
-  for (size_t i = 0; i < data_len; i++) {
-    const uint8_t value = data[i];
+  size_t offset = 0;
+  while (offset < dataLength) {
+    processEsp3ReceiveBuffer();
 
-    // 同期バイトを受信するまでは読み飛ばす
-    if (enoceanBufferIndex == 0) {
-      if (value != 0x55) {
-        continue;
-      }
-      enoceanBuffer[enoceanBufferIndex++] = value;
+    size_t available = ESP3_RECEIVE_BUFFER_SIZE - esp3ReceiveLength;
+    if (available == 0) {
+      Serial2.println("ESP3 receive buffer overflow; resynchronizing");
+      discardEsp3ReceiveBytes(1);
       continue;
     }
 
-    if (enoceanBufferIndex >= ENOCEAN_BUFFER_SIZE) {
-      Serial2.println("EnOcean buffer overflow");
-      enoceanBufferIndex = 0;
-      continue;
+    size_t copyLength = dataLength - offset;
+    if (copyLength > available) {
+      copyLength = available;
     }
-    enoceanBuffer[enoceanBufferIndex++] = value;
-
-    if (enoceanBufferIndex < 6) {
-      continue;
-    }
-
-    // ヘッダーが壊れている場合は早めに同期待ちへ戻る
-    if (enoceanBufferIndex == 6 && calcCRC8(&enoceanBuffer[1], 4) != enoceanBuffer[5]) {
-      Serial2.println("Header CRC error");
-      enoceanBufferIndex = 0;
-      continue;
-    }
-
-    const size_t packetLength = 7 +
-                                (((size_t)enoceanBuffer[1] << 8) | enoceanBuffer[2]) +
-                                enoceanBuffer[3];
-    if (packetLength > ENOCEAN_BUFFER_SIZE) {
-      Serial2.println("EnOcean packet too large");
-      enoceanBufferIndex = 0;
-      continue;
-    }
-
-    if (enoceanBufferIndex == packetLength) {
-      EnOceanPacket packet = {};
-      if (parseEnOceanPacket(enoceanBuffer, enoceanBufferIndex, packet)) {
-        displayEnOceanPacket(packet);
-      }
-      enoceanBufferIndex = 0;
-    }
+    memcpy(&esp3ReceiveBuffer[esp3ReceiveLength], &data[offset], copyLength);
+    esp3ReceiveLength += copyLength;
+    offset += copyLength;
   }
+
+  processEsp3ReceiveBuffer();
 }
 
 void handleUsbSerialInput() {
@@ -252,6 +311,11 @@ void updateUsbConnectionState() {
 
   isConnected = connected;
   Serial2.println(isConnected ? "USB Serial Connected" : "USB Serial Disconnected");
+  if (!isConnected && esp3ReceiveLength > 0) {
+    Serial2.printf("Discarding %u byte(s) of incomplete ESP3 data\n",
+                   (unsigned int)esp3ReceiveLength);
+    clearEsp3ReceiveBuffer();
+  }
 }
 
 void setup() {
