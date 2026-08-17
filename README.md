@@ -4,14 +4,14 @@ M5AtomS3とSTM431JモジュールでEnOceanデータを受信・表示するArdu
 
 ## 概要
 
-このプロジェクトは、M5AtomS3とEnOcean受信モジュール（USB400J、STM431J）を使用して、EnOcean無線センサーからのデータを受信し、温度とデバイスIDをディスプレイに表示するシステムです。
+このプロジェクトは、M5AtomS3、EnOcean受信モジュールUSB400J、送信モジュールSTM431Jを使用して、温度とデバイスIDをディスプレイに表示するシステムです。
 
 ## 主な機能
 
-- **EnOcean ESP3プロトコル解析**: EnOcean標準プロトコルを完全サポート
+- **EnOcean ESP3プロトコル解析**: RADIO_ERP2形式の4BS telegramに対応
 - **USB CDC-ACM通信**: USB400Jモジュールとの通信をUSB経由で実現
 - **温度センサー対応**: EEP A5-02-05（温度センサー 0-40℃）に対応
-- **CRC8検証**: パケットの整合性をCRC8チェックサムで確認
+- **CRC8検証**: ESP3と内包されたERP2 telegramの整合性をCRC8チェックサムで確認
 - **リアルタイム表示**: ディスプレイにデバイスIDと温度をリアルタイム表示
 - **デバッグ出力**: シリアル経由で詳細なデバッグ情報を出力
 
@@ -43,19 +43,21 @@ M5AtomS3とSTM431JモジュールでEnOceanデータを受信・表示するArdu
 ### 開発環境
 
 - Arduino IDE 1.8.x 以上 または Arduino IDE 2.x
-- ESP32ボードサポート（esp32 by Espressif Systems）
+- ESP32ボードサポート 3.2.0以上（M5StackまたはEspressif Systems）
 
 ### 必要なライブラリ
 
-1. **M5AtomS3** - M5Stack公式ライブラリ
+1. **M5Unified** - M5Stack公式ライブラリ
    ```
-   ライブラリマネージャーで「M5AtomS3」を検索してインストール
+   ライブラリマネージャーで「M5Unified」を検索してインストール
    ```
 
-2. **esp32-usb-serial** - USB CDC-ACM通信ライブラリ
+2. **EspUsbHost** - USB CDC-ACM/VCP通信ライブラリ
    ```
-   https://github.com/luc-github/esp32-usb-serial
+   Arduino IDEのライブラリマネージャーで「EspUsbHost」を検索してインストール
    ```
+
+   GitHub: https://github.com/tanakamasayuki/EspUsbHost
 
 ### 通信設定
 
@@ -91,15 +93,16 @@ M5AtomS3とSTM431JモジュールでEnOceanデータを受信・表示するArdu
 
 2. **データ受信**
    - STM431J（または他のEnOceanセンサー）が送信を開始すると自動的にデータを受信
-   - ディスプレイに以下が表示されます：
-     - デバイスID（32bit、16進数）
-     - 温度（℃、小数点1桁）
+   - 通常データ受信時はデバイスID（32bit/48bit、16進数）と温度（℃、小数点1桁）を表示
+   - Teach-in受信時はデバイスIDと、その下に`Teach-in`を表示
 
 3. **操作**
    - **ボタンA押下**: 画面をクリア
 
 4. **デバッグ**
    - Serial2（GPIO5/6）を115200bpsで接続すると詳細なログが確認できます
+   - `USB chunk`: EspUsbHostから1回に読み出したデータ（パケット途中で分割される場合があります）
+   - `ESP3 packet`: 一時バッファで再構築した完全なESP3パケット
 
 ## EnOcean EEP対応
 
@@ -120,22 +123,95 @@ M5AtomS3とSTM431JモジュールでEnOceanデータを受信・表示するArdu
 - **0x55**: 同期バイト
 - **DataLen**: データ長（16bit）
 - **OptLen**: オプショナルデータ長
-- **Type**: パケットタイプ（0x0A = RADIO_ERP1）
+- **Type**: パケットタイプ（0x0A = RADIO_ERP2）
 - **CRC8H**: ヘッダーCRC
 - **Data**: データ部
 - **OptData**: オプショナルデータ
 - **CRC8D**: データCRC
 
+### RADIO_ERP2 / A5-02-05解析
+
+ESP3の`Data`には、先頭のLENGTHを除いたERP2 telegramが格納されます。
+このプロジェクトではERP2ヘッダーのAddress ControlからOriginator ID長を決定し、
+32bit ID（ヘッダー`0x22`）と48bit ID（ヘッダー`0x62`）の両方を処理します。
+
+```
+[ERP2 Header][Originator ID][DB3][DB2][DB1][DB0][ERP2 CRC]
+```
+
+実機で取得したSTM431Jの例:
+
+```text
+# Teach-in telegram（48bit ID=0x00000400CB76、液晶にTeach-inとIDを表示）
+55 00 0C 02 0A E6 62 00 00 04 00 CB 76 08 28 0B 80 89 01 2B C4
+
+# 通常データtelegram（32bit ID、ID=0x0400CB76）
+55 00 0A 02 0A 9B 22 04 00 CB 76 00 00 55 08 BD 01 29 CA
+```
+
+4BSの`DB0`にあるLearn bitが0の場合はTeach-in telegramとして判定し、
+液晶にOriginator IDと、その下に`Teach-in`を表示します。
+
+```text
+EnOcean受信:
+
+ID: 00000400CB76
+
+Teach-in
+```
+
+通常データでは`DB1`をA5-02-05の温度値として、次式で0〜40℃に変換します。
+
+```text
+温度[℃] = 40 - (DB1 × 40 / 255)
+```
+
+上記の通常データでは`DB1 = 0x55`なので、温度は約26.67℃です。
+
 ### CRC8計算
 
 EnOcean標準CRC8多項式: `0x07`
+
+- ESP3ヘッダーCRC: `DataLen_H`から`Type`までを検証
+- ESP3データCRC: `Data`と`OptData`を検証
+- ERP2 CRC: ERP2の`Header`からCRC直前までを検証（`Length`自身は対象外）
+
+ESP3データCRCが正常でも、内包されたERP2 CRCが不正な場合は温度やTeach-in状態を表示せず、
+`Invalid ERP2 CRC`をデバッグログへ出力してパケットを破棄します。
+
+### USBシリアル受信処理
+
+USBシリアルの読み出し境界はESP3パケット境界と一致するとは限りません。このため、
+EspUsbHostから読み出したデータを1024バイトの一時バッファへ蓄積し、次の手順で処理します。
+
+1. 同期バイト`0x55`を検索
+2. 6バイトのESP3ヘッダーとヘッダーCRCを確認
+3. `7 + DataLen + OptLen`からパケット全体の長さを算出
+4. 完全なパケットが揃うまで次の受信データを待機
+5. ESP3データCRCを確認
+6. RADIO_ERP2の場合は内包されたERP2 CRCを確認してからパケットを解析
+7. バッファに後続パケットがあれば続けて解析
+
+これにより、1パケットが複数回に分割された場合、複数パケットを一度に受信した場合、
+および受信データの同期がずれた場合に対応します。CRCエラー時は次の同期バイトを探索し、
+USB切断時には受信途中のデータを破棄します。
+
+ESP3データCRCが不正な場合は、ヘッダーの宣言長が信頼できない可能性があるため、
+宣言されたパケット全体ではなく現在の同期バイト`0x55`だけを破棄します。
+残りの受信データから次のヘッダーCRCが正常なESP3ヘッダーを探索することで、欠落バイトによって
+後続パケットの同期バイトが見かけ上のパケット長へ取り込まれた場合も再同期します。
+
+デバッグログではUSBの読み出し単位を`USB chunk`、再構築後の完全なパケットを
+`ESP3 packet`として区別して表示します。分割受信時は複数の`USB chunk`の後に、
+それらを結合した1件の`ESP3 packet`が表示されます。
 
 ## トラブルシューティング
 
 ### USB400Jが認識されない
 
 - USB400JがM5AtomS3のUSBポートに正しく接続されているか確認
-- Serial2のデバッグ出力で"USB Connected"が表示されるか確認
+- Serial2のデバッグ出力で"USB Serial Connected"が表示されるか確認
+- EspUsbHostがインストールされ、ESP32ボードサポートが3.2.0以上であることを確認
 - USB CDC On Bootが有効になっているか確認
 
 ### データが受信できない
@@ -162,7 +238,7 @@ Copyright (c) 2026 Haruhito Fuji
 - [EnOcean Alliance](https://www.enocean-alliance.org/)
 - [EnOcean Serial Protocol (ESP3)](https://www.enocean.com/esp)
 - [M5AtomS3 Docs](https://docs.m5stack.com/en/core/AtomS3)
-- [esp32-usb-serial Library](https://github.com/luc-github/esp32-usb-serial)
+- [EspUsbHost Library](https://github.com/tanakamasayuki/EspUsbHost)
 
 ## 開発者
 
@@ -170,6 +246,20 @@ Haruhito Fuji
 
 ## 更新履歴
 
+- **2026-08-18**: ESP3データCRCエラー時の再同期処理を改善
+  - CRC不正時に宣言パケット長を破棄せず、次のヘッダーCRCが正常なESP3ヘッダーを探索
+  - 欠落バイトを含むフレームの直後にある正常パケットを保持
+- **2026-08-17**: USB HostライブラリをEspUsbHostへ変更
+  - EspUsbHostCdcSerialによるUSB CDC-ACM/VCP通信へ移行
+  - 独自のUSB接続タスクとセマフォを削除
+  - M5AtomS3ラッパーをM5Unifiedの直接利用へ変更
+  - USB受信データを1024バイト蓄積し、完全なESP3パケット単位で解析
+  - CRCエラー時の再同期とUSB切断時の受信バッファ破棄に対応
+  - RADIO_ERP2の32bit/48bit Originator IDとTeach-in判定に対応
+  - EEP A5-02-05の温度変換式を修正
+  - USB読み出し単位と再構築済みESP3パケットのログを分離
+  - Teach-in受信時の液晶表示を追加
+  - 内包されたERP2 CRCを検証し、不正なradio telegramを破棄
 - **2026-01-25**: 初版リリース
   - EnOcean ESP3プロトコル対応
   - EEP A5-02-05（温度センサー）実装

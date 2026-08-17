@@ -11,10 +11,11 @@
  *   表示します。
  * 
  * @features
- *   - USB CDC-ACM経由でSTM431Jと通信
+ *   - USB CDC-ACM経由でUSB400Jと通信
  *   - EnOcean ESP3プロトコル解析
+ *   - RADIO_ERP2の32bit/48bit Originator ID対応
  *   - EEP A5-02-05（温度センサー）対応
- *   - デバイスID（32bit）と温度（℃）をディスプレイ表示
+ *   - デバイスIDと温度（℃）をディスプレイ表示
  *   - CRC8チェックサムによるパケット検証
  * 
  * @hardware
@@ -29,11 +30,11 @@
  *   - USB: USB400J接続
  * 
  * @dependencies
- *   - M5AtomS3 Library
- *   - esp32-usb-serial (https://github.com/luc-github/esp32-usb-serial)
+ *   - M5Unified Library
+ *   - EspUsbHost (https://github.com/tanakamasayuki/EspUsbHost)
  * 
  * @communication
- *   - STM431J: 57600bps, 8N1, USB CDC-ACM
+ *   - USB400J: 57600bps, 8N1, USB CDC-ACM
  *   - Serial2 (Debug): 115200bps, 8N1
  * 
  * @eep_support
@@ -48,46 +49,41 @@
  * 
  ******************************************************************************/
 
-#include "M5AtomS3.h"
+#include "M5Unified.h"
+#include "EspUsbHost.h"
 
-#include "esp32_usb_serial.h"
-#include "freertos/FreeRTOS.h"
-#include "freertos/semphr.h"
-#include "freertos/task.h"
+#define USB_SERIAL_BAUDRATE 57600
+#define USB_SERIAL_RX_BUFFER_SIZE 1024
+#define ESP3_RECEIVE_BUFFER_SIZE 1024
+#define ESP3_HEADER_SIZE 6
+#define ESP3_SYNC_BYTE 0x55
+#define ESP3_PACKET_TYPE_RADIO_ERP2 0x0A
+#define ERP2_ADDRESS_CONTROL_MASK 0xE0
+#define ERP2_EXTENDED_HEADER_FLAG 0x10
+#define ERP2_RORG_MASK 0x0F
+#define ERP2_RORG_4BS 0x02
+#define FOUR_BS_DATA_SIZE 4
+#define FOUR_BS_LEARN_BIT 0x08
 
-#define ESP_USB_SERIAL_BAUDRATE 57600
-#define ESP_USB_SERIAL_DATA_BITS (8)
-// 0: 1 stopbit, 1: 1.5 stopbits, 2: 2 stopbits
-#define ESP_USB_SERIAL_PARITY (0)
-// 0: None, 1: Odd, 2: Even, 3: Mark, 4: Space
-#define ESP_USB_SERIAL_STOP_BITS (0)
-
-#define ESP_USB_SERIAL_RX_BUFFER_SIZE 512
-#define ESP_USB_SERIAL_TX_BUFFER_SIZE 128
-#define ESP_USB_SERIAL_TASK_SIZE 4096
-#define ESP_USB_SERIAL_TASK_CORE 1
-#define ESP_USB_SERIAL_TASK_PRIORITY 10
-
-SemaphoreHandle_t device_disconnected_sem;
-std::unique_ptr<CdcAcmDevice> vcp;
+EspUsbHost usb;
+EspUsbHostCdcSerial usbSerial(usb);
 bool isConnected = false;
-bool usbReady = false;
-TaskHandle_t xHandle;
 
-// EnOcean受信バッファ
-#define ENOCEAN_BUFFER_SIZE 256
-uint8_t enoceanBuffer[ENOCEAN_BUFFER_SIZE];
-size_t enoceanBufferIndex = 0;
+// USBの読み出し境界に依存せず、完全なESP3パケットになるまで保持する
+uint8_t esp3ReceiveBuffer[ESP3_RECEIVE_BUFFER_SIZE];
+size_t esp3ReceiveLength = 0;
 
 // EnOceanパケット構造体
 struct EnOceanPacket {
-  uint8_t dataLength;
+  uint16_t dataLength;
   uint8_t optionalLength;
   uint8_t packetType;
   uint8_t data[256];
   uint8_t optionalData[256];
-  uint32_t senderId;
+  uint64_t senderId;
+  uint8_t senderIdLength;
   float temperature;
+  bool teachIn;
   bool valid;
 };
 
@@ -109,20 +105,79 @@ uint8_t calcCRC8(const uint8_t *data, size_t len) {
   return crc;
 }
 
+uint64_t readBigEndianId(const uint8_t *data, size_t length) {
+  uint64_t value = 0;
+  for (size_t i = 0; i < length; i++) {
+    value = (value << 8) | data[i];
+  }
+  return value;
+}
+
+bool getErp2AddressLengths(uint8_t erp2Header, size_t &originatorLength,
+                           size_t &destinationLength) {
+  destinationLength = 0;
+  switch (erp2Header & ERP2_ADDRESS_CONTROL_MASK) {
+    case 0x00:
+      originatorLength = 3;
+      return true;
+    case 0x20:
+      originatorLength = 4;
+      return true;
+    case 0x40:
+      originatorLength = 4;
+      destinationLength = 4;
+      return true;
+    case 0x60:
+      originatorLength = 6;
+      return true;
+    default:
+      return false;
+  }
+}
+
+void formatSenderId(uint64_t senderId, uint8_t senderIdLength,
+                    char *output, size_t outputSize) {
+  if (senderIdLength <= 4) {
+    snprintf(output, outputSize, "%08lX", (unsigned long)senderId);
+    return;
+  }
+
+  snprintf(output, outputSize, "%04lX%08lX",
+           (unsigned long)((senderId >> 32) & 0xFFFF),
+           (unsigned long)(senderId & 0xFFFFFFFFULL));
+}
+
+void printHexBytes(const char *label, const uint8_t *data, size_t length) {
+  Serial2.printf("%s (%u bytes): ", label, (unsigned int)length);
+  for (size_t i = 0; i < length; i++) {
+    if (data[i] < 16) Serial2.print('0');
+    Serial2.print(data[i], HEX);
+    Serial2.print(' ');
+  }
+  Serial2.println();
+}
+
 /**
  * @brief EnOceanパケット解析
  */
 bool parseEnOceanPacket(const uint8_t *buffer, size_t len, EnOceanPacket &packet) {
-  if (len < 6) return false;
-  if (buffer[0] != 0x55) return false;  // 同期バイトチェック
+  packet.valid = false;
+  packet.teachIn = false;
 
-  packet.dataLength = (buffer[1] << 8) | buffer[2];
+  if (len < ESP3_HEADER_SIZE) return false;
+  if (buffer[0] != ESP3_SYNC_BYTE) return false;  // 同期バイトチェック
+
+  packet.dataLength = ((uint16_t)buffer[1] << 8) | buffer[2];
   packet.optionalLength = buffer[3];
   packet.packetType = buffer[4];
 
   // パケット全体の長さチェック
-  size_t totalLen = 6 + packet.dataLength + packet.optionalLength + 1;
+  size_t totalLen = ESP3_HEADER_SIZE + packet.dataLength + packet.optionalLength + 1;
   if (len < totalLen) return false;
+  if (packet.dataLength > sizeof(packet.data)) {
+    Serial2.println("ESP3 payload too large");
+    return false;
+  }
 
   // ヘッダーCRCチェック
   uint8_t headerCRC = calcCRC8(&buffer[1], 4);
@@ -142,178 +197,252 @@ bool parseEnOceanPacket(const uint8_t *buffer, size_t len, EnOceanPacket &packet
     return false;
   }
 
+  if (packet.packetType != ESP3_PACKET_TYPE_RADIO_ERP2 || packet.dataLength < 2) {
+    return false;
+  }
+
+  // RADIO_ERP2のDATA部にはLENGTHを除いたERP2 telegramが格納される
+  const uint8_t erp2Header = packet.data[0];
+  if ((erp2Header & ERP2_RORG_MASK) != ERP2_RORG_4BS) {
+    return false;
+  }
+
+  size_t cursor = 1;
+  uint8_t radioOptionalLength = 0;
+  if ((erp2Header & ERP2_EXTENDED_HEADER_FLAG) != 0) {
+    if (cursor >= packet.dataLength - 1) return false;
+    radioOptionalLength = packet.data[cursor++] & 0x0F;
+  }
+
+  size_t originatorLength = 0;
+  size_t destinationLength = 0;
+  if (!getErp2AddressLengths(erp2Header, originatorLength, destinationLength)) {
+    return false;
+  }
+
+  // DATA末尾の1バイトはERP2自身のCRC
+  const size_t erp2CrcOffset = packet.dataLength - 1;
+  const uint8_t expectedErp2Crc = packet.data[erp2CrcOffset];
+  const uint8_t calculatedErp2Crc = calcCRC8(packet.data, erp2CrcOffset);
+  if (calculatedErp2Crc != expectedErp2Crc) {
+    Serial2.printf("Invalid ERP2 CRC: expected 0x%02X, calculated 0x%02X\n",
+                   expectedErp2Crc, calculatedErp2Crc);
+    return false;
+  }
+
+  if (radioOptionalLength > erp2CrcOffset - cursor) return false;
+  const size_t radioDataEnd = erp2CrcOffset - radioOptionalLength;
+  if (cursor + originatorLength + destinationLength > radioDataEnd) return false;
+
+  packet.senderId = readBigEndianId(&packet.data[cursor], originatorLength);
+  packet.senderIdLength = originatorLength;
+  cursor += originatorLength + destinationLength;
+
+  if (radioDataEnd - cursor != FOUR_BS_DATA_SIZE) {
+    return false;
+  }
+
+  const uint8_t *fourBsData = &packet.data[cursor];
+  packet.teachIn = (fourBsData[3] & FOUR_BS_LEARN_BIT) == 0;
+
+  char senderIdText[13];
+  formatSenderId(packet.senderId, packet.senderIdLength,
+                 senderIdText, sizeof(senderIdText));
+  if (packet.teachIn) {
+    packet.valid = true;
+    Serial2.printf("Teach-in telegram from Device ID: %s\n", senderIdText);
+    return true;
+  }
+
+  // EEP A5-02-05: DB1の255..0を0..40℃へ変換
+  const uint8_t temperatureRaw = fourBsData[2];
+  packet.temperature = 40.0f - ((float)temperatureRaw * 40.0f / 255.0f);
   packet.valid = true;
 
-  // パケットタイプ 0x0A (RADIO_ERP1)の場合
-  if (packet.packetType == 0x0A && packet.dataLength >= 10) {
-    // EEP A5-02-05 (温度センサー)の解析
-    uint8_t choice = packet.data[0];  // RORG (0x9B = 4BS)
-
-    if (choice == 0x9B) {  // 4BS telegram
-      // 送信元ID (最後の4バイト、Learn bitの前)
-      packet.senderId = ((uint32_t)packet.data[packet.dataLength - 5] << 24) | ((uint32_t)packet.data[packet.dataLength - 4] << 16) | ((uint32_t)packet.data[packet.dataLength - 3] << 8) | ((uint32_t)packet.data[packet.dataLength - 2]);
-
-      // A5-02-05: DB1に温度データ (0-250 = 0-40℃)
-      uint8_t tempValue = packet.data[2];
-      packet.temperature = (float)tempValue * 40.0 / 250.0;
-
-      Serial2.printf("Device ID: %08X, Temp: %.1f C\n", packet.senderId, packet.temperature);
-    }
-  }
-
+  Serial2.printf("Device ID: %s, Temp: %.1f C\n",
+                 senderIdText, packet.temperature);
   return true;
 }
 
-/**
- * @brief Data received callback
- */
-bool rx_callback(const uint8_t *data, size_t data_len, void *arg) {
-  // デバッグ用：受信データを16進数で表示
-  Serial2.print("RX: ");
-  for (size_t i = 0; i < data_len; i++) {
-    if (data[i] < 16) Serial2.print('0');
-    Serial2.print(data[i], HEX);
-    Serial2.print(' ');
-  }
-  Serial2.println();
+void displayEnOceanPacket(const EnOceanPacket &packet) {
+  char senderIdText[13];
+  formatSenderId(packet.senderId, packet.senderIdLength,
+                 senderIdText, sizeof(senderIdText));
 
-  // バッファに追加
-  for (size_t i = 0; i < data_len; i++) {
-    if (enoceanBufferIndex >= ENOCEAN_BUFFER_SIZE) {
-      enoceanBufferIndex = 0;  // オーバーフロー時はリセット
-    }
-    enoceanBuffer[enoceanBufferIndex++] = data[i];
+  M5.Display.fillScreen(BLACK);
+  M5.Display.setCursor(0, 0);
+  M5.Display.setTextSize(1);
+  M5.Display.setTextColor(WHITE);
 
-    // 同期バイト検出
-    if (data[i] == 0x55 && i == 0) {
-      // 新しいパケットの開始
-      enoceanBufferIndex = 1;
-      enoceanBuffer[0] = 0x55;
-    }
-  }
+  M5.Display.println("EnOcean受信:");
+  M5.Display.println();
 
-  // パケット解析を試行
-  if (enoceanBufferIndex >= 6) {
-    EnOceanPacket packet;
-    if (parseEnOceanPacket(enoceanBuffer, enoceanBufferIndex, packet)) {
-      // 解析成功、ディスプレイを更新
-      M5.Display.fillScreen(BLACK);
-      M5.Display.setCursor(0, 0);
-      M5.Display.setTextSize(1);
-      M5.Display.setTextColor(WHITE);
+  M5.Display.printf("ID: %s\n", senderIdText);
+  M5.Display.println();
 
-      M5.Display.println("EnOcean受信:");
-      M5.Display.println();
-      M5.Display.printf("ID: %08X\n", packet.senderId);
-      M5.Display.println();
-      M5.Display.setTextSize(2);
-      M5.Display.printf("温度: %.1f C\n", packet.temperature);
-
-      // バッファをクリア
-      enoceanBufferIndex = 0;
-    }
-  }
-
-  return true;
-}
-
-/**
- * @brief Device event callback
- *
- * Apart from handling device disconnection it doesn't do anything useful
- */
-void handle_event(const cdc_acm_host_dev_event_data_t *event, void *user_ctx) {
-  switch (event->type) {
-    case CDC_ACM_HOST_ERROR:
-      Serial2.printf("CDC-ACM error has occurred, err_no = %d\n",
-                     event->data.error);
-      break;
-    case CDC_ACM_HOST_DEVICE_DISCONNECTED:
-      Serial2.println("Device suddenly disconnected");
-      xSemaphoreGive(device_disconnected_sem);
-      isConnected = false;
-      break;
-    case CDC_ACM_HOST_SERIAL_STATE:
-      Serial2.printf("Serial state notif 0x%04X\n",
-                     event->data.serial_state.val);
-      break;
-    case CDC_ACM_HOST_NETWORK_CONNECTION:
-      Serial2.println("Network connection established");
-      break;
-    default:
-      Serial2.println("Unknown event");
-      break;
-  }
-}
-
-void connectDevice() {
-  if (!usbReady || isConnected) {
-    return;
-  }
-  const cdc_acm_host_device_config_t dev_config = {
-    .connection_timeout_ms = 5000,  // 5 seconds, enough time to plug the
-                                    // device in or experiment with timeout
-    .out_buffer_size = ESP_USB_SERIAL_TX_BUFFER_SIZE,
-    .in_buffer_size = ESP_USB_SERIAL_RX_BUFFER_SIZE,
-    .event_cb = handle_event,
-    .data_cb = rx_callback,
-    .user_arg = NULL,
-  };
-  cdc_acm_line_coding_t line_coding = {
-    .dwDTERate = ESP_USB_SERIAL_BAUDRATE,
-    .bCharFormat = ESP_USB_SERIAL_STOP_BITS,
-    .bParityType = ESP_USB_SERIAL_PARITY,
-    .bDataBits = ESP_USB_SERIAL_DATA_BITS,
-  };
-  // You don't need to know the device's VID and PID. Just plug in any device
-  // and the VCP service will pick correct (already registered) driver for the
-  // device
-  Serial2.println("Opening any VCP device...");
-  vcp = std::unique_ptr<CdcAcmDevice>(esp_usb::VCP::open(&dev_config));
-
-  if (vcp == nullptr) {
-    Serial2.println("Failed to open VCP device, retrying...");
+  if (packet.teachIn) {
+    M5.Display.setTextSize(2);
+    M5.Display.println("Teach-in");
     return;
   }
 
-  vTaskDelay(10);
+  M5.Display.setTextSize(2);
+  M5.Display.printf("温度: %.1f C\n", packet.temperature);
+}
 
-  Serial2.println("USB detected");
+void discardEsp3ReceiveBytes(size_t count) {
+  if (count >= esp3ReceiveLength) {
+    esp3ReceiveLength = 0;
+    return;
+  }
 
-  if (vcp->line_coding_set(&line_coding) == ESP_OK) {
-    Serial2.println("USB Connected");
-    isConnected = true;
-    uint16_t vid = esp_usb::getVID();
-    uint16_t pid = esp_usb::getPID();
-    Serial2.printf("USB device with VID: 0x%04X (%s), PID: 0x%04X (%s) found\n",
-                   vid, esp_usb::getVIDString(), pid, esp_usb::getPIDString());
-    xSemaphoreTake(device_disconnected_sem, portMAX_DELAY);
-    vTaskDelay(10);
+  memmove(esp3ReceiveBuffer, &esp3ReceiveBuffer[count], esp3ReceiveLength - count);
+  esp3ReceiveLength -= count;
+}
 
-    vcp = nullptr;
-  } else {
-    Serial2.println("USB device not identified");
+void clearEsp3ReceiveBuffer() {
+  esp3ReceiveLength = 0;
+}
+
+/**
+ * @brief 蓄積済みデータから完全なESP3パケットをすべて取り出す
+ */
+void processEsp3ReceiveBuffer() {
+  while (esp3ReceiveLength > 0) {
+    // 同期ずれしたデータを捨て、次の0x55をパケット先頭候補にする
+    size_t syncOffset = 0;
+    while (syncOffset < esp3ReceiveLength &&
+           esp3ReceiveBuffer[syncOffset] != ESP3_SYNC_BYTE) {
+      syncOffset++;
+    }
+    if (syncOffset > 0) {
+      Serial2.printf("ESP3 resync: discarded %u byte(s)\n", (unsigned int)syncOffset);
+      discardEsp3ReceiveBytes(syncOffset);
+    }
+
+    // ヘッダーが分割されている場合は次の受信を待つ
+    if (esp3ReceiveLength < ESP3_HEADER_SIZE) {
+      return;
+    }
+
+    if (calcCRC8(&esp3ReceiveBuffer[1], 4) != esp3ReceiveBuffer[5]) {
+      Serial2.println("Header CRC error; resynchronizing");
+      discardEsp3ReceiveBytes(1);
+      continue;
+    }
+
+    const uint16_t dataLength =
+      ((uint16_t)esp3ReceiveBuffer[1] << 8) | esp3ReceiveBuffer[2];
+    const uint8_t optionalLength = esp3ReceiveBuffer[3];
+    const size_t packetLength = ESP3_HEADER_SIZE +
+                                (size_t)dataLength + optionalLength + 1;
+
+    if (packetLength > ESP3_RECEIVE_BUFFER_SIZE) {
+      Serial2.printf("ESP3 packet too large: %u byte(s)\n", (unsigned int)packetLength);
+      discardEsp3ReceiveBytes(1);
+      continue;
+    }
+
+    // データ部が分割されている場合は完全なパケットになるまで保持する
+    if (esp3ReceiveLength < packetLength) {
+      return;
+    }
+
+    // USBの読み出し境界ではなく、再構築済みのESP3パケットを1行で表示
+    printHexBytes("ESP3 packet", esp3ReceiveBuffer, packetLength);
+
+    const size_t payloadLength = (size_t)dataLength + optionalLength;
+    const uint8_t expectedDataCrc =
+      esp3ReceiveBuffer[ESP3_HEADER_SIZE + payloadLength];
+    const uint8_t calculatedDataCrc =
+      calcCRC8(&esp3ReceiveBuffer[ESP3_HEADER_SIZE], payloadLength);
+    if (calculatedDataCrc != expectedDataCrc) {
+      Serial2.printf("Invalid ESP3 data CRC: expected 0x%02X, calculated 0x%02X; resynchronizing\n",
+                     expectedDataCrc, calculatedDataCrc);
+      // 宣言長が壊れている可能性があるため全長は捨てず、現在の同期バイトだけを除去する。
+      // 次のループで残りのデータからCRCが正しいESP3ヘッダーを探索する。
+      discardEsp3ReceiveBytes(1);
+      continue;
+    }
+
+    EnOceanPacket packet = {};
+    if (parseEnOceanPacket(esp3ReceiveBuffer, packetLength, packet)) {
+      displayEnOceanPacket(packet);
+    }
+
+    // ESP3データCRCが正常な場合だけ、ヘッダーで算出したパケット全体を破棄する
+    discardEsp3ReceiveBytes(packetLength);
   }
 }
 
-// this task only handle connection
-static void esp_usb_serial_connection_task(void *pvParameter) {
-  (void)pvParameter;
-  while (1) {
-    /* Delay */
-    vTaskDelay(pdMS_TO_TICKS(10));
-    if (!usbReady) {
+/**
+ * @brief EspUsbHostの受信リングから読み出したデータを一時バッファへ蓄積
+ */
+void processReceivedData(const uint8_t *data, size_t dataLength) {
+  // USB CDCから今回読み出せた単位。ESP3パケット境界とは一致しない場合がある
+  printHexBytes("USB chunk", data, dataLength);
+
+  size_t offset = 0;
+  while (offset < dataLength) {
+    processEsp3ReceiveBuffer();
+
+    size_t available = ESP3_RECEIVE_BUFFER_SIZE - esp3ReceiveLength;
+    if (available == 0) {
+      Serial2.println("ESP3 receive buffer overflow; resynchronizing");
+      discardEsp3ReceiveBytes(1);
+      continue;
+    }
+
+    size_t copyLength = dataLength - offset;
+    if (copyLength > available) {
+      copyLength = available;
+    }
+    memcpy(&esp3ReceiveBuffer[esp3ReceiveLength], &data[offset], copyLength);
+    esp3ReceiveLength += copyLength;
+    offset += copyLength;
+  }
+
+  processEsp3ReceiveBuffer();
+}
+
+void handleUsbSerialInput() {
+  uint8_t data[64];
+
+  while (usbSerial.available() > 0) {
+    size_t dataLength = 0;
+    while (dataLength < sizeof(data) && usbSerial.available() > 0) {
+      const int value = usbSerial.read();
+      if (value < 0) {
+        break;
+      }
+      data[dataLength++] = (uint8_t)value;
+    }
+
+    if (dataLength == 0) {
       break;
     }
-    connectDevice();
+    processReceivedData(data, dataLength);
   }
-  /* A task should NEVER return */
-  vTaskDelete(NULL);
+}
+
+void updateUsbConnectionState() {
+  const bool connected = usbSerial.connected();
+  if (connected == isConnected) {
+    return;
+  }
+
+  isConnected = connected;
+  Serial2.println(isConnected ? "USB Serial Connected" : "USB Serial Disconnected");
+  if (!isConnected && esp3ReceiveLength > 0) {
+    Serial2.printf("Discarding %u byte(s) of incomplete ESP3 data\n",
+                   (unsigned int)esp3ReceiveLength);
+    clearEsp3ReceiveBuffer();
+  }
 }
 
 void setup() {
   auto cfg = M5.config();
-  AtomS3.begin(cfg);
+  M5.begin(cfg);
 
   // Serial.begin(115200);
   Serial2.begin(115200, SERIAL_8N1, 5, 6);  // MAX3232側のシリアルの初期化
@@ -322,30 +451,26 @@ void setup() {
   Serial2.println("");
 
   // USB初期化
-  if (ESP_OK != usb_serial_init()) {
-    Serial2.println("Initialisation failed");
-  } else {
-    if (ESP_OK != usb_serial_create_task()) {
-      Serial2.println("Task Creation failed");
-    } else {
-      Serial2.println("Success");
-    }
-    device_disconnected_sem = xSemaphoreCreateBinary();
-    if (device_disconnected_sem == NULL) {
-      Serial2.println("Semaphore creation failed");
-      return;
-    }
-    BaseType_t res = xTaskCreatePinnedToCore(
-      esp_usb_serial_connection_task, "esp_usb_serial_task",
-      ESP_USB_SERIAL_TASK_SIZE, NULL, ESP_USB_SERIAL_TASK_PRIORITY, &xHandle,
-      ESP_USB_SERIAL_TASK_CORE);
-    if (res != pdPASS || !xHandle) {
-      Serial2.println("Task creation failed");
-      return;
-    }
-    Serial2.println("USB Serial Connection Task created successfully");
+  usb.onDeviceConnected([](const EspUsbHostDeviceInfo &device) {
+    Serial2.print("USB device connected: ");
+    espUsbHostPrint(device, Serial2);
+  });
+  usb.onDeviceDisconnected([](const EspUsbHostDeviceInfo &device) {
+    Serial2.print("USB device disconnected: ");
+    espUsbHostPrint(device, Serial2);
+  });
+
+  if (!usbSerial.setRxBufferSize(USB_SERIAL_RX_BUFFER_SIZE)) {
+    Serial2.println("USB Serial RX buffer allocation failed");
   }
-  usbReady = true;
+  if (!usbSerial.begin(USB_SERIAL_BAUDRATE)) {
+    Serial2.println("USB Serial initialization failed");
+  }
+  if (!usb.begin()) {
+    Serial2.printf("USB Host initialization failed: %s\n", usb.lastErrorName());
+  } else {
+    Serial2.println("USB Host initialized");
+  }
 
   // ディスプレイの初期化
   M5.Display.setRotation(1);
@@ -359,6 +484,8 @@ void setup() {
 
 void loop() {
   M5.update();
+  updateUsbConnectionState();
+  handleUsbSerialInput();
 
   if (M5.BtnA.isPressed()) {
     M5.Display.fillScreen(BLACK);
@@ -367,4 +494,6 @@ void loop() {
     M5.Display.println("画面クリア");
     M5.Display.println("EnOcean待機中...");
   }
+
+  delay(1);
 }
