@@ -11,10 +11,11 @@
  *   表示します。
  * 
  * @features
- *   - USB CDC-ACM経由でSTM431Jと通信
+ *   - USB CDC-ACM経由でUSB400Jと通信
  *   - EnOcean ESP3プロトコル解析
+ *   - RADIO_ERP2の32bit/48bit Originator ID対応
  *   - EEP A5-02-05（温度センサー）対応
- *   - デバイスID（32bit）と温度（℃）をディスプレイ表示
+ *   - デバイスIDと温度（℃）をディスプレイ表示
  *   - CRC8チェックサムによるパケット検証
  * 
  * @hardware
@@ -33,7 +34,7 @@
  *   - EspUsbHost (https://github.com/tanakamasayuki/EspUsbHost)
  * 
  * @communication
- *   - STM431J: 57600bps, 8N1, USB CDC-ACM
+ *   - USB400J: 57600bps, 8N1, USB CDC-ACM
  *   - Serial2 (Debug): 115200bps, 8N1
  * 
  * @eep_support
@@ -56,6 +57,13 @@
 #define ESP3_RECEIVE_BUFFER_SIZE 1024
 #define ESP3_HEADER_SIZE 6
 #define ESP3_SYNC_BYTE 0x55
+#define ESP3_PACKET_TYPE_RADIO_ERP2 0x0A
+#define ERP2_ADDRESS_CONTROL_MASK 0xE0
+#define ERP2_EXTENDED_HEADER_FLAG 0x10
+#define ERP2_RORG_MASK 0x0F
+#define ERP2_RORG_4BS 0x02
+#define FOUR_BS_DATA_SIZE 4
+#define FOUR_BS_LEARN_BIT 0x08
 
 EspUsbHost usb;
 EspUsbHostCdcSerial usbSerial(usb);
@@ -72,8 +80,10 @@ struct EnOceanPacket {
   uint8_t packetType;
   uint8_t data[256];
   uint8_t optionalData[256];
-  uint32_t senderId;
+  uint64_t senderId;
+  uint8_t senderIdLength;
   float temperature;
+  bool teachIn;
   bool valid;
 };
 
@@ -95,10 +105,55 @@ uint8_t calcCRC8(const uint8_t *data, size_t len) {
   return crc;
 }
 
+uint64_t readBigEndianId(const uint8_t *data, size_t length) {
+  uint64_t value = 0;
+  for (size_t i = 0; i < length; i++) {
+    value = (value << 8) | data[i];
+  }
+  return value;
+}
+
+bool getErp2AddressLengths(uint8_t erp2Header, size_t &originatorLength,
+                           size_t &destinationLength) {
+  destinationLength = 0;
+  switch (erp2Header & ERP2_ADDRESS_CONTROL_MASK) {
+    case 0x00:
+      originatorLength = 3;
+      return true;
+    case 0x20:
+      originatorLength = 4;
+      return true;
+    case 0x40:
+      originatorLength = 4;
+      destinationLength = 4;
+      return true;
+    case 0x60:
+      originatorLength = 6;
+      return true;
+    default:
+      return false;
+  }
+}
+
+void formatSenderId(uint64_t senderId, uint8_t senderIdLength,
+                    char *output, size_t outputSize) {
+  if (senderIdLength <= 4) {
+    snprintf(output, outputSize, "%08lX", (unsigned long)senderId);
+    return;
+  }
+
+  snprintf(output, outputSize, "%04lX%08lX",
+           (unsigned long)((senderId >> 32) & 0xFFFF),
+           (unsigned long)(senderId & 0xFFFFFFFFULL));
+}
+
 /**
  * @brief EnOceanパケット解析
  */
 bool parseEnOceanPacket(const uint8_t *buffer, size_t len, EnOceanPacket &packet) {
+  packet.valid = false;
+  packet.teachIn = false;
+
   if (len < ESP3_HEADER_SIZE) return false;
   if (buffer[0] != ESP3_SYNC_BYTE) return false;  // 同期バイトチェック
 
@@ -132,30 +187,69 @@ bool parseEnOceanPacket(const uint8_t *buffer, size_t len, EnOceanPacket &packet
     return false;
   }
 
-  packet.valid = true;
-
-  // パケットタイプ 0x0A (RADIO_ERP1)の場合
-  if (packet.packetType == 0x0A && packet.dataLength >= 10) {
-    // EEP A5-02-05 (温度センサー)の解析
-    uint8_t choice = packet.data[0];  // RORG (0x9B = 4BS)
-
-    if (choice == 0x9B) {  // 4BS telegram
-      // 送信元ID (最後の4バイト、Learn bitの前)
-      packet.senderId = ((uint32_t)packet.data[packet.dataLength - 5] << 24) | ((uint32_t)packet.data[packet.dataLength - 4] << 16) | ((uint32_t)packet.data[packet.dataLength - 3] << 8) | ((uint32_t)packet.data[packet.dataLength - 2]);
-
-      // A5-02-05: DB1に温度データ (0-250 = 0-40℃)
-      uint8_t tempValue = packet.data[2];
-      packet.temperature = (float)tempValue * 40.0 / 250.0;
-
-      Serial2.printf("Device ID: %08lX, Temp: %.1f C\n",
-                     (unsigned long)packet.senderId, packet.temperature);
-    }
+  if (packet.packetType != ESP3_PACKET_TYPE_RADIO_ERP2 || packet.dataLength < 2) {
+    return false;
   }
 
+  // RADIO_ERP2のDATA部にはLENGTHを除いたERP2 telegramが格納される
+  const uint8_t erp2Header = packet.data[0];
+  if ((erp2Header & ERP2_RORG_MASK) != ERP2_RORG_4BS) {
+    return false;
+  }
+
+  size_t cursor = 1;
+  uint8_t radioOptionalLength = 0;
+  if ((erp2Header & ERP2_EXTENDED_HEADER_FLAG) != 0) {
+    if (cursor >= packet.dataLength - 1) return false;
+    radioOptionalLength = packet.data[cursor++] & 0x0F;
+  }
+
+  size_t originatorLength = 0;
+  size_t destinationLength = 0;
+  if (!getErp2AddressLengths(erp2Header, originatorLength, destinationLength)) {
+    return false;
+  }
+
+  // DATA末尾の1バイトはERP2自身のCRC
+  const size_t erp2CrcOffset = packet.dataLength - 1;
+  if (radioOptionalLength > erp2CrcOffset - cursor) return false;
+  const size_t radioDataEnd = erp2CrcOffset - radioOptionalLength;
+  if (cursor + originatorLength + destinationLength > radioDataEnd) return false;
+
+  packet.senderId = readBigEndianId(&packet.data[cursor], originatorLength);
+  packet.senderIdLength = originatorLength;
+  cursor += originatorLength + destinationLength;
+
+  if (radioDataEnd - cursor != FOUR_BS_DATA_SIZE) {
+    return false;
+  }
+
+  const uint8_t *fourBsData = &packet.data[cursor];
+  packet.teachIn = (fourBsData[3] & FOUR_BS_LEARN_BIT) == 0;
+
+  char senderIdText[13];
+  formatSenderId(packet.senderId, packet.senderIdLength,
+                 senderIdText, sizeof(senderIdText));
+  if (packet.teachIn) {
+    Serial2.printf("Teach-in telegram from Device ID: %s\n", senderIdText);
+    return false;
+  }
+
+  // EEP A5-02-05: DB1の255..0を0..40℃へ変換
+  const uint8_t temperatureRaw = fourBsData[2];
+  packet.temperature = 40.0f - ((float)temperatureRaw * 40.0f / 255.0f);
+  packet.valid = true;
+
+  Serial2.printf("Device ID: %s, Temp: %.1f C\n",
+                 senderIdText, packet.temperature);
   return true;
 }
 
 void displayEnOceanPacket(const EnOceanPacket &packet) {
+  char senderIdText[13];
+  formatSenderId(packet.senderId, packet.senderIdLength,
+                 senderIdText, sizeof(senderIdText));
+
   M5.Display.fillScreen(BLACK);
   M5.Display.setCursor(0, 0);
   M5.Display.setTextSize(1);
@@ -163,7 +257,7 @@ void displayEnOceanPacket(const EnOceanPacket &packet) {
 
   M5.Display.println("EnOcean受信:");
   M5.Display.println();
-  M5.Display.printf("ID: %08lX\n", (unsigned long)packet.senderId);
+  M5.Display.printf("ID: %s\n", senderIdText);
   M5.Display.println();
   M5.Display.setTextSize(2);
   M5.Display.printf("温度: %.1f C\n", packet.temperature);

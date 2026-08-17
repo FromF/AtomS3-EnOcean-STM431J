@@ -4,11 +4,11 @@ M5AtomS3とSTM431JモジュールでEnOceanデータを受信・表示するArdu
 
 ## 概要
 
-このプロジェクトは、M5AtomS3とEnOcean受信モジュール（USB400J、STM431J）を使用して、EnOcean無線センサーからのデータを受信し、温度とデバイスIDをディスプレイに表示するシステムです。
+このプロジェクトは、M5AtomS3、EnOcean受信モジュールUSB400J、送信モジュールSTM431Jを使用して、温度とデバイスIDをディスプレイに表示するシステムです。
 
 ## 主な機能
 
-- **EnOcean ESP3プロトコル解析**: EnOcean標準プロトコルを完全サポート
+- **EnOcean ESP3プロトコル解析**: RADIO_ERP2形式の4BS telegramに対応
 - **USB CDC-ACM通信**: USB400Jモジュールとの通信をUSB経由で実現
 - **温度センサー対応**: EEP A5-02-05（温度センサー 0-40℃）に対応
 - **CRC8検証**: パケットの整合性をCRC8チェックサムで確認
@@ -94,7 +94,7 @@ M5AtomS3とSTM431JモジュールでEnOceanデータを受信・表示するArdu
 2. **データ受信**
    - STM431J（または他のEnOceanセンサー）が送信を開始すると自動的にデータを受信
    - ディスプレイに以下が表示されます：
-     - デバイスID（32bit、16進数）
+     - デバイスID（32bit/48bit、16進数）
      - 温度（℃、小数点1桁）
 
 3. **操作**
@@ -122,11 +122,40 @@ M5AtomS3とSTM431JモジュールでEnOceanデータを受信・表示するArdu
 - **0x55**: 同期バイト
 - **DataLen**: データ長（16bit）
 - **OptLen**: オプショナルデータ長
-- **Type**: パケットタイプ（0x0A = RADIO_ERP1）
+- **Type**: パケットタイプ（0x0A = RADIO_ERP2）
 - **CRC8H**: ヘッダーCRC
 - **Data**: データ部
 - **OptData**: オプショナルデータ
 - **CRC8D**: データCRC
+
+### RADIO_ERP2 / A5-02-05解析
+
+ESP3の`Data`には、先頭のLENGTHを除いたERP2 telegramが格納されます。
+このプロジェクトではERP2ヘッダーのAddress ControlからOriginator ID長を決定し、
+32bit ID（ヘッダー`0x22`）と48bit ID（ヘッダー`0x62`）の両方を処理します。
+
+```
+[ERP2 Header][Originator ID][DB3][DB2][DB1][DB0][ERP2 CRC]
+```
+
+実機で取得したSTM431Jの例:
+
+```text
+# Teach-in telegram（48bit ID=0x00000400CB76、表示対象外）
+55 00 0C 02 0A E6 62 00 00 04 00 CB 76 08 28 0B 80 89 01 2B C4
+
+# 通常データtelegram（32bit ID、ID=0x0400CB76）
+55 00 0A 02 0A 9B 22 04 00 CB 76 00 00 55 08 BD 01 29 CA
+```
+
+4BSの`DB0`にあるLearn bitが0の場合はTeach-in telegramとして表示対象から除外します。
+通常データでは`DB1`をA5-02-05の温度値として、次式で0〜40℃に変換します。
+
+```text
+温度[℃] = 40 - (DB1 × 40 / 255)
+```
+
+上記の通常データでは`DB1 = 0x55`なので、温度は約26.67℃です。
 
 ### CRC8計算
 
@@ -195,6 +224,8 @@ Haruhito Fuji
   - M5AtomS3ラッパーをM5Unifiedの直接利用へ変更
   - USB受信データを1024バイト蓄積し、完全なESP3パケット単位で解析
   - CRCエラー時の再同期とUSB切断時の受信バッファ破棄に対応
+  - RADIO_ERP2の32bit/48bit Originator IDとTeach-in判定に対応
+  - EEP A5-02-05の温度変換式を修正
 - **2026-01-25**: 初版リリース
   - EnOcean ESP3プロトコル対応
   - EEP A5-02-05（温度センサー）実装
