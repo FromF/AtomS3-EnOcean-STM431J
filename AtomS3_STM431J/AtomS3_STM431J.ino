@@ -356,17 +356,21 @@ void processEsp3ReceiveBuffer() {
       esp3ReceiveBuffer[ESP3_HEADER_SIZE + payloadLength];
     const uint8_t calculatedDataCrc =
       calcCRC8(&esp3ReceiveBuffer[ESP3_HEADER_SIZE], payloadLength);
-    if (calculatedDataCrc == expectedDataCrc) {
-      EnOceanPacket packet = {};
-      if (parseEnOceanPacket(esp3ReceiveBuffer, packetLength, packet)) {
-        displayEnOceanPacket(packet);
-      }
-    } else {
-      Serial2.printf("Invalid ESP3 data CRC: expected 0x%02X, calculated 0x%02X\n",
+    if (calculatedDataCrc != expectedDataCrc) {
+      Serial2.printf("Invalid ESP3 data CRC: expected 0x%02X, calculated 0x%02X; resynchronizing\n",
                      expectedDataCrc, calculatedDataCrc);
+      // 宣言長が壊れている可能性があるため全長は捨てず、現在の同期バイトだけを除去する。
+      // 次のループで残りのデータからCRCが正しいESP3ヘッダーを探索する。
+      discardEsp3ReceiveBytes(1);
+      continue;
     }
 
-    // CRC不正時もヘッダーで算出したパケット長を捨て、次のパケットへ進む
+    EnOceanPacket packet = {};
+    if (parseEnOceanPacket(esp3ReceiveBuffer, packetLength, packet)) {
+      displayEnOceanPacket(packet);
+    }
+
+    // ESP3データCRCが正常な場合だけ、ヘッダーで算出したパケット全体を破棄する
     discardEsp3ReceiveBytes(packetLength);
   }
 }
